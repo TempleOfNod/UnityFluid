@@ -1,0 +1,41 @@
+-------------------------------
+0 & 1
+-------------------------------
+Timestep: 0.05
+Count: 1500
+Mass: 3
+Rest density: 10
+Smooth range: 5
+Stiffness: 5
+Viscosity: 0
+Gravity: 1
+Collision dampen: 0
+Collision bounce: 0
+
+-------------------------------
+2
+-------------------------------
+Timestep: 0.05
+Count: 1500
+Mass: 2
+Rest density: 10
+Smooth range: 5
+Stiffness: 5
+Viscosity: 0
+Gravity: 1
+Collision dampen: 0
+Collision bounce: 0
+
+-------------------------------
+3
+-------------------------------
+Timestep: 0.05
+Count: 1500
+Mass: 4
+Rest density: 10
+Smooth range: 5
+Stiffness: 5
+Viscosity: 0
+Gravity: 1
+Collision dampen: 0
+Collision bounce: 0
