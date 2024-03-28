@@ -1,3 +1,5 @@
+A simple fluid simulation using Unity's particle system. Check the final report paper for more info.
+
 =========================================
 How to run
 =========================================
