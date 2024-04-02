@@ -1,4 +1,4 @@
-A simple fluid simulation using Unity's particle system. Check the final report paper for more info.
+A simple fluid simulation using Unity's particle system and smoothed particle hydrodynamics (SPH) algorithm. Check the final report paper for more info.
 
 =========================================
 How to run
