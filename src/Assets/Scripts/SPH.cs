@@ -14,8 +14,8 @@ public class SPH : MonoBehaviour
 {
     ParticleSystem m_sys;
     ParticleSystem.Particle[] m_particles;
-    Vector3[,] m_kernelgrad_buf;
-    float[,] m_kernel_buf;
+    Vector3[] m_kernelgrad_buf;
+    float[] m_kernel_buf;
     float[] m_densities;
     float[] m_pressures;
     int m_size;
@@ -106,8 +106,8 @@ public class SPH : MonoBehaviour
             m_particles = new ParticleSystem.Particle[maxsize];
             m_densities = new float[maxsize];
             m_pressures = new float[maxsize];
-            m_kernel_buf = new float[maxsize, maxsize];
-            m_kernelgrad_buf = new Vector3[maxsize, maxsize];
+            m_kernel_buf = new float[maxsize * maxsize];
+            m_kernelgrad_buf = new Vector3[maxsize * maxsize];
             for (int i = 0; i < maxsize; i++)
             {
                 m_densities[i] = rest_density;
@@ -145,22 +145,17 @@ public class SPH : MonoBehaviour
         // w(i,j) == w(j,i)
         // grad(w(i,j)) == -grad(w(j,i))
 
-        // TODO: use threads
+        // TODO: use jobs
         // TODO: neighbour search optimization
         for (int i = 0; i < m_size; i++)
         {
-            for (int j = 0; j < m_size; j++)
+            for (int j = i + 1; j < m_size; j++)
             {
-                if (j > i)
-                {
-                    m_kernel_buf[i, j] = Kernel(i, j);
-                    m_kernelgrad_buf[i, j] = KernelGrad(i, j);
-                }
-                else if (j < i)
-                {
-                    m_kernel_buf[i, j] = m_kernel_buf[j, i];
-                    m_kernelgrad_buf[i, j] = -m_kernelgrad_buf[j, i];
-                }
+                m_kernel_buf[i + j * m_size] = Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
+                m_kernel_buf[j + i * m_size] = m_kernel_buf[i + j * m_size];
+
+                m_kernelgrad_buf[i + j * m_size] = KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
+                m_kernelgrad_buf[j + i * m_size] = -m_kernelgrad_buf[i + j * m_size];
             }
         }
 
@@ -174,7 +169,7 @@ public class SPH : MonoBehaviour
             {
                 if (j != i)
                 {
-                    m_densities[i] += m_kernel_buf[i, j];
+                    m_densities[i] += m_kernel_buf[i + j * m_size];
                 }
             }
             m_densities[i] *= mass;
@@ -202,7 +197,7 @@ public class SPH : MonoBehaviour
             if (j != index)
             {
                 float p_j = m_pressures[j] * Mathf.Pow(m_densities[j], -2);
-                a -= (p_i + p_j) * m_kernelgrad_buf[index, j];
+                a -= (p_i + p_j) * m_kernelgrad_buf[index + j * m_size];
             }
         }
         a *= mass;
@@ -223,7 +218,7 @@ public class SPH : MonoBehaviour
                     // an approximation that avoids computing Laplacian
                     Vector3 x_ij = m_particles[index].position - m_particles[j].position;
                     Vector3 v_ij = m_particles[index].velocity - m_particles[j].velocity;
-                    float f = Vector3.Dot(x_ij, m_kernelgrad_buf[index, j])
+                    float f = Vector3.Dot(x_ij, m_kernelgrad_buf[index + j * m_size])
                         * (1.0f / (m_densities[j] *
                         (Vector3.Dot(x_ij, x_ij) + 0.01f * smooth_range * smooth_range)));
 
@@ -237,10 +232,9 @@ public class SPH : MonoBehaviour
 
     // kernel function
     // Ihmsen et al. Eq. (4) & (5)
-    float Kernel(int i, int j)
+    static float Kernel(Vector3 posi, Vector3 posj, float smooth_range)
     {
-        float length = (m_particles[i].position - m_particles[j].position)
-            .magnitude * (1.0f / smooth_range);
+        float length = (posi - posj).magnitude * (1.0f / smooth_range);
         if (length >= 2.0f) return 0.0f;
 
         float output = 3.0f / (2.0f * Mathf.PI * Mathf.Pow(smooth_range, 3));
@@ -257,9 +251,9 @@ public class SPH : MonoBehaviour
 
     // kernel function gradient
     // chain rule: grad(w(||x_i - x_j|| / h)) = w'(||x_i - x_j|| / h) * grad(||x_i - x_j|| / h)
-    Vector3 KernelGrad(int i, int j)
+    static Vector3 KernelGrad(Vector3 posi, Vector3 posj, float smooth_range)
     {
-        Vector3 v = m_particles[i].position - m_particles[j].position;
+        Vector3 v = posi - posj;
         float length = v.magnitude * (1.0f / smooth_range);
         if (length >= 2.0f) return Vector3.zero;
 
