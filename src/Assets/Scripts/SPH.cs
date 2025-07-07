@@ -74,7 +74,9 @@ public class SPH : MonoBehaviour
     {
         for (int i = start; i < end; i++)
         {
-            m_particles[i].velocity += GetAcceleration(i) * m_dt;
+            m_particles[i].velocity += GetAcceleration(m_particles, m_kernelgrad_buf,
+                m_pressures, m_densities, i, mass, viscosity, smooth_range)
+                * m_dt;
         }
     }
 
