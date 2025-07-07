@@ -124,15 +124,17 @@ public class SPH : MonoBehaviour
     }
 
     // total acceleration per update
-    Vector3 GetAcceleration(int index)
+    static Vector3 GetAcceleration(ParticleSystem.Particle[] particles, Vector3[] gradients,
+        float[] pressures, float[] densities, int index, float mass, float viscosity, float smooth_range)
     {
         Vector3 ret;
 
         // pressure
-        ret = GetPressureAcceleration(index);
+        ret = GetPressureAcceleration(gradients, pressures, densities, index, mass);
 
         // diffusion
-        ret += GetDiffusionAcceleration(index);
+        ret += GetDiffusionAcceleration(particles, gradients, densities,
+            index, mass, viscosity, smooth_range);
 
         return ret;
     }
@@ -151,10 +153,12 @@ public class SPH : MonoBehaviour
         {
             for (int j = i + 1; j < m_size; j++)
             {
-                m_kernel_buf[i + j * m_size] = Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
+                m_kernel_buf[i + j * m_size] =
+                    Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
                 m_kernel_buf[j + i * m_size] = m_kernel_buf[i + j * m_size];
 
-                m_kernelgrad_buf[i + j * m_size] = KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
+                m_kernelgrad_buf[i + j * m_size] =
+                    KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
                 m_kernelgrad_buf[j + i * m_size] = -m_kernelgrad_buf[i + j * m_size];
             }
         }
@@ -186,18 +190,20 @@ public class SPH : MonoBehaviour
     }
 
     // get acceleration from pressure on one particle
-    Vector3 GetPressureAcceleration(int index)
+    static Vector3 GetPressureAcceleration(Vector3[] gradients, float[] pressures, float[] densities,
+        int index, float mass)
     {
         // find pressure force with mass 1
         // House & Keyser Eq. (14.6)
         Vector3 a = Vector3.zero;
-        float p_i = m_pressures[index] * Mathf.Pow(m_densities[index], -2);
-        for (int j = 0; j < m_size; j++)
+        float p_i = pressures[index] * Mathf.Pow(densities[index], -2);
+        int size = pressures.Length;
+        for (int j = 0; j < size; j++)
         {
             if (j != index)
             {
-                float p_j = m_pressures[j] * Mathf.Pow(m_densities[j], -2);
-                a -= (p_i + p_j) * m_kernelgrad_buf[index + j * m_size];
+                float p_j = pressures[j] * Mathf.Pow(densities[j], -2);
+                a -= (p_i + p_j) * gradients[index + j * size];
             }
         }
         a *= mass;
@@ -205,21 +211,23 @@ public class SPH : MonoBehaviour
     }
 
     // get acceleration from diffusion/viscosity on one particle
-    Vector3 GetDiffusionAcceleration(int index)
+    static Vector3 GetDiffusionAcceleration(ParticleSystem.Particle[] particles, Vector3[] gradients,
+        float[] densities, int index, float mass, float viscosity, float smooth_range)
     {
         Vector3 a = Vector3.zero;
+        int size = particles.Length;
         if (viscosity > 0.0f)
         {
-            for (int j = 0; j < m_size; j++)
+            for (int j = 0; j < size; j++)
             {
                 if (index != j)
                 {
                     // Ihmsen et al. Eq. (8)
                     // an approximation that avoids computing Laplacian
-                    Vector3 x_ij = m_particles[index].position - m_particles[j].position;
-                    Vector3 v_ij = m_particles[index].velocity - m_particles[j].velocity;
-                    float f = Vector3.Dot(x_ij, m_kernelgrad_buf[index + j * m_size])
-                        * (1.0f / (m_densities[j] *
+                    Vector3 x_ij = particles[index].position - particles[j].position;
+                    Vector3 v_ij = particles[index].velocity - particles[j].velocity;
+                    float f = Vector3.Dot(x_ij, gradients[index + j * size])
+                        * (1.0f / (densities[j] *
                         (Vector3.Dot(x_ij, x_ij) + 0.01f * smooth_range * smooth_range)));
 
                     a += f * v_ij;
