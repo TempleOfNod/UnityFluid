@@ -10,6 +10,7 @@ using System.Threading;
 using System.Diagnostics;
 using UnityEngine;
 using Unity.Collections;
+using Unity.Jobs;
 
 public class SPH : MonoBehaviour
 {
@@ -57,8 +58,42 @@ public class SPH : MonoBehaviour
         // update attributes if necessary
         AttributeUpdate();
 
-        // update kernel buffers and densities
-        Precompute();
+        // update kernel values and kernel gradients
+        // w(i,j) == w(j,i)
+        // grad(w(i,j)) == -grad(w(j,i))
+
+        // TODO: use jobs
+        // TODO: neighbour search optimization
+        for (int i = 0; i < m_size; i++)
+        {
+            for (int j = i + 1; j < m_size; j++)
+            {
+                m_kernels[i + j * m_size] =
+                    Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
+                m_kernels[j + i * m_size] = m_kernels[i + j * m_size];
+
+                m_gradients[i + j * m_size] =
+                    KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
+                m_gradients[j + i * m_size] = -m_gradients[i + j * m_size];
+            }
+        }
+
+        // update densities and pressures using kernel values
+        var dpJob = new DensitiesPressuresJob()
+        {
+            kernels = m_kernels,
+            length = m_sys.main.maxParticles,
+            delta_time = m_dt,
+            stiffness = stiffness,
+            rest_density = rest_density,
+            mass = mass,
+            densities = m_densities,
+            pressures = m_pressures
+        };
+        var dpHandle = dpJob.Schedule(dpJob.length, dpJob.length / thread_count);
+
+        // complete immediately for now until more jobs are added
+        dpHandle.Complete();
 
         // update velocities using threads
         int thread_load = m_size / thread_count;
@@ -151,56 +186,6 @@ public class SPH : MonoBehaviour
             index, mass, viscosity, smooth_range);
 
         return ret;
-    }
-
-    // compute each particle's density using kernel function
-    // run this before getAcceleration()
-    void Precompute()
-    {
-        // compute kernel outputs
-        // w(i,j) == w(j,i)
-        // grad(w(i,j)) == -grad(w(j,i))
-
-        // TODO: use jobs
-        // TODO: neighbour search optimization
-        for (int i = 0; i < m_size; i++)
-        {
-            for (int j = i + 1; j < m_size; j++)
-            {
-                m_kernels[i + j * m_size] =
-                    Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
-                m_kernels[j + i * m_size] = m_kernels[i + j * m_size];
-
-                m_gradients[i + j * m_size] =
-                    KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
-                m_gradients[j + i * m_size] = -m_gradients[i + j * m_size];
-            }
-        }
-
-        // density and pressure
-        for (int i = 0; i < m_size; i++)
-        {
-            // update densities
-            // House & Keyser Eq. (14.3)
-            m_densities[i] = 0.0f;
-            for (int j = 0; j < m_size; j++)
-            {
-                if (j != i)
-                {
-                    m_densities[i] += m_kernels[i + j * m_size];
-                }
-            }
-            m_densities[i] *= mass;
-
-            // update pressures (Tait with gamma = 1)
-            // House & Keyser Eq. (14.5)
-
-            m_pressures[i] = stiffness * (m_densities[i] - rest_density);
-            // alternative equation (Tait with gamma = 7)
-            // Ihmsen et al. Eq. (9)
-            // stiffness * Mathf.Pow(m_densities[i] / rest_density, 7) - 1
-            // not compatible with single precision float
-        }
     }
 
     // get acceleration from pressure on one particle
@@ -300,5 +285,61 @@ public class SPH : MonoBehaviour
         // = 0.5 / (h * sqrt(x^2 + y^2 + z^2)) * 2x
         // = x / (h * sqrt(x^2 + y^2 + z^2))
         return v.normalized * output;
+    }
+
+
+    // job to update densities and pressures of each particle
+    // dependency: m_kernels must be updated
+    struct DensitiesPressuresJob : IJobParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<float> kernels;                      // size n^2
+
+        [ReadOnly]
+        public int length;
+
+        [ReadOnly]
+        public float delta_time;
+
+        [ReadOnly]
+        public float stiffness;
+
+        [ReadOnly]
+        public float rest_density;
+
+        [ReadOnly]
+        public float mass;
+
+        // outputs
+        public NativeArray<float> densities;                    // size n
+        public NativeArray<float> pressures;                    // size n
+
+        public void Execute(int i)
+        {
+            // make sure Execute() runs n times, not n^2
+            // job.Schedule(loop count, batch size)
+
+            // update densities
+            // House & Keyser Eq. (14.3)
+            densities[i] = 0.0f;
+            for (int j = 0; j < length; j++)
+            {
+                if (j != i)
+                {
+                    densities[i] += kernels[i + j * length];
+                }
+            }
+            densities[i] *= mass;
+
+            // update pressures (Tait with gamma = 1)
+            // House & Keyser Eq. (14.5)
+
+            pressures[i] = stiffness * (densities[i] - rest_density);
+            // alternative equation (Tait with gamma = 7)
+            // Ihmsen et al. Eq. (9)
+            // stiffness * Mathf.Pow(m_densities[i] / rest_density, 7) - 1
+            // not compatible with single precision float
+        }
     }
 }
