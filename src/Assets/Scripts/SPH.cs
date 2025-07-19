@@ -9,15 +9,16 @@
 using System.Threading;
 using System.Diagnostics;
 using UnityEngine;
+using Unity.Collections;
 
 public class SPH : MonoBehaviour
 {
     ParticleSystem m_sys;
     ParticleSystem.Particle[] m_particles;
-    Vector3[] m_kernelgrad_buf;
-    float[] m_kernel_buf;
-    float[] m_densities;
-    float[] m_pressures;
+    NativeArray<Vector3> m_gradients;
+    NativeArray<float> m_kernels;
+    NativeArray<float> m_densities;
+    NativeArray<float> m_pressures;
     int m_size;
     float m_dt;
 
@@ -32,10 +33,18 @@ public class SPH : MonoBehaviour
 
     Stopwatch m_watch;
 
-    void Start()
+    void OnEnable()
     {
         m_watch = new Stopwatch();
         m_watch.Start();
+    }
+
+    void OnDisable()
+    {
+        m_gradients.Dispose();
+        m_kernels.Dispose();
+        m_densities.Dispose();
+        m_pressures.Dispose();
     }
 
     void FixedUpdate()
@@ -74,8 +83,8 @@ public class SPH : MonoBehaviour
     {
         for (int i = start; i < end; i++)
         {
-            m_particles[i].velocity += GetAcceleration(m_particles, m_kernelgrad_buf,
-                m_pressures, m_densities, i, mass, viscosity, smooth_range)
+            m_particles[i].velocity += GetAcceleration(m_particles, m_gradients,
+                m_densities, m_pressures, i, mass, viscosity, smooth_range)
                 * m_dt;
         }
     }
@@ -106,10 +115,11 @@ public class SPH : MonoBehaviour
         {
             int maxsize = m_sys.main.maxParticles;
             m_particles = new ParticleSystem.Particle[maxsize];
-            m_densities = new float[maxsize];
-            m_pressures = new float[maxsize];
-            m_kernel_buf = new float[maxsize * maxsize];
-            m_kernelgrad_buf = new Vector3[maxsize * maxsize];
+
+            m_densities = new NativeArray<float>(maxsize, Allocator.Persistent);
+            m_pressures = new NativeArray<float>(maxsize, Allocator.Persistent);
+            m_kernels = new NativeArray<float>(maxsize * maxsize, Allocator.Persistent);
+            m_gradients = new NativeArray<Vector3>(maxsize * maxsize, Allocator.Persistent);
             for (int i = 0; i < maxsize; i++)
             {
                 m_densities[i] = rest_density;
@@ -126,13 +136,15 @@ public class SPH : MonoBehaviour
     }
 
     // total acceleration per update
-    static Vector3 GetAcceleration(ParticleSystem.Particle[] particles, Vector3[] gradients,
-        float[] pressures, float[] densities, int index, float mass, float viscosity, float smooth_range)
+    static Vector3 GetAcceleration(ParticleSystem.Particle[] particles,
+        NativeArray<Vector3> gradients, NativeArray<float> densities,
+        NativeArray<float> pressures, int index, float mass, float viscosity,
+        float smooth_range)
     {
         Vector3 ret;
 
         // pressure
-        ret = GetPressureAcceleration(gradients, pressures, densities, index, mass);
+        ret = GetPressureAcceleration(gradients, densities, pressures, index, mass);
 
         // diffusion
         ret += GetDiffusionAcceleration(particles, gradients, densities,
@@ -155,13 +167,13 @@ public class SPH : MonoBehaviour
         {
             for (int j = i + 1; j < m_size; j++)
             {
-                m_kernel_buf[i + j * m_size] =
+                m_kernels[i + j * m_size] =
                     Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
-                m_kernel_buf[j + i * m_size] = m_kernel_buf[i + j * m_size];
+                m_kernels[j + i * m_size] = m_kernels[i + j * m_size];
 
-                m_kernelgrad_buf[i + j * m_size] =
+                m_gradients[i + j * m_size] =
                     KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
-                m_kernelgrad_buf[j + i * m_size] = -m_kernelgrad_buf[i + j * m_size];
+                m_gradients[j + i * m_size] = -m_gradients[i + j * m_size];
             }
         }
 
@@ -175,14 +187,14 @@ public class SPH : MonoBehaviour
             {
                 if (j != i)
                 {
-                    m_densities[i] += m_kernel_buf[i + j * m_size];
+                    m_densities[i] += m_kernels[i + j * m_size];
                 }
             }
             m_densities[i] *= mass;
 
             // update pressures (Tait with gamma = 1)
             // House & Keyser Eq. (14.5)
-            
+
             m_pressures[i] = stiffness * (m_densities[i] - rest_density);
             // alternative equation (Tait with gamma = 7)
             // Ihmsen et al. Eq. (9)
@@ -192,8 +204,8 @@ public class SPH : MonoBehaviour
     }
 
     // get acceleration from pressure on one particle
-    static Vector3 GetPressureAcceleration(Vector3[] gradients, float[] pressures, float[] densities,
-        int index, float mass)
+    static Vector3 GetPressureAcceleration(NativeArray<Vector3> gradients,
+        NativeArray<float> densities, NativeArray<float> pressures, int index, float mass)
     {
         // find pressure force with mass 1
         // House & Keyser Eq. (14.6)
@@ -213,8 +225,9 @@ public class SPH : MonoBehaviour
     }
 
     // get acceleration from diffusion/viscosity on one particle
-    static Vector3 GetDiffusionAcceleration(ParticleSystem.Particle[] particles, Vector3[] gradients,
-        float[] densities, int index, float mass, float viscosity, float smooth_range)
+    static Vector3 GetDiffusionAcceleration(ParticleSystem.Particle[] particles,
+        NativeArray<Vector3> gradients, NativeArray<float> densities, int index,
+        float mass, float viscosity, float smooth_range)
     {
         Vector3 a = Vector3.zero;
         int size = particles.Length;
@@ -260,7 +273,8 @@ public class SPH : MonoBehaviour
     }
 
     // kernel function gradient
-    // chain rule: grad(w(||x_i - x_j|| / h)) = w'(||x_i - x_j|| / h) * grad(||x_i - x_j|| / h)
+    // chain rule:
+    // grad(w(||x_i - x_j|| / h)) = w'(||x_i - x_j|| / h) * grad(||x_i - x_j|| / h)
     static Vector3 KernelGrad(Vector3 posi, Vector3 posj, float smooth_range)
     {
         Vector3 v = posi - posj;
