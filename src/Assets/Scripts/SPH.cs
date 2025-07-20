@@ -11,11 +11,14 @@ using System.Diagnostics;
 using UnityEngine;
 using Unity.Collections;
 using Unity.Jobs;
+using UnityEngine.ParticleSystemJobs;
 
 public class SPH : MonoBehaviour
 {
     ParticleSystem m_sys;
     ParticleSystem.Particle[] m_particles;
+    NativeArray<Vector3> m_positions;
+    NativeArray<Vector3> m_velocities;
     NativeArray<Vector3> m_gradients;
     NativeArray<float> m_kernels;
     NativeArray<float> m_densities;
@@ -42,6 +45,8 @@ public class SPH : MonoBehaviour
 
     void OnDisable()
     {
+        m_positions.Dispose();
+        m_velocities.Dispose();
         m_gradients.Dispose();
         m_kernels.Dispose();
         m_densities.Dispose();
@@ -58,31 +63,43 @@ public class SPH : MonoBehaviour
         // update attributes if necessary
         AttributeUpdate();
 
+        // update particle data
+        var dataJob = new ParticleDataJob()
+        {
+            positions = m_positions,
+            velocities = m_velocities
+        };
+        var dataHandle = dataJob.Schedule(m_sys, m_size / thread_count);
+
         // update kernel values and kernel gradients
         // w(i,j) == w(j,i)
         // grad(w(i,j)) == -grad(w(j,i))
-
-        // TODO: use jobs
         // TODO: neighbour search optimization
-        for (int i = 0; i < m_size; i++)
+        var kernelJob = new KernelJob()
         {
-            for (int j = i + 1; j < m_size; j++)
-            {
-                m_kernels[i + j * m_size] =
-                    Kernel(m_particles[i].position, m_particles[j].position, smooth_range);
-                m_kernels[j + i * m_size] = m_kernels[i + j * m_size];
+            positions = m_positions,
+            length = m_size,
+            smooth_range = smooth_range,
+            kernels = m_kernels
+        };
+        var kernelHandle = kernelJob.Schedule(m_size * m_size,
+            m_size * m_size / thread_count, dataHandle);
 
-                m_gradients[i + j * m_size] =
-                    KernelGrad(m_particles[i].position, m_particles[j].position, smooth_range);
-                m_gradients[j + i * m_size] = -m_gradients[i + j * m_size];
-            }
-        }
+        var kernelGradJob = new KernelGradJob()
+        {
+            positions = m_positions,
+            length = m_size,
+            smooth_range = smooth_range,
+            gradients = m_gradients
+        };
+        var kernelGradHandle = kernelGradJob.Schedule(m_size * m_size,
+            m_size * m_size / thread_count, dataHandle);
 
         // update densities and pressures using kernel values
         var dpJob = new DensitiesPressuresJob()
         {
             kernels = m_kernels,
-            length = m_sys.main.maxParticles,
+            length = m_size,
             delta_time = m_dt,
             stiffness = stiffness,
             rest_density = rest_density,
@@ -90,9 +107,11 @@ public class SPH : MonoBehaviour
             densities = m_densities,
             pressures = m_pressures
         };
-        var dpHandle = dpJob.Schedule(dpJob.length, dpJob.length / thread_count);
+        var dpHandle = dpJob.Schedule(dpJob.length, dpJob.length / thread_count,
+            kernelHandle);
 
         // complete immediately for now until more jobs are added
+        kernelGradHandle.Complete();
         dpHandle.Complete();
 
         // update velocities using threads
@@ -151,10 +170,12 @@ public class SPH : MonoBehaviour
             int maxsize = m_sys.main.maxParticles;
             m_particles = new ParticleSystem.Particle[maxsize];
 
+            m_positions = new NativeArray<Vector3>(maxsize, Allocator.Persistent);
+            m_velocities = new NativeArray<Vector3>(maxsize, Allocator.Persistent);
+            m_gradients = new NativeArray<Vector3>(maxsize * maxsize, Allocator.Persistent);
+            m_kernels = new NativeArray<float>(maxsize * maxsize, Allocator.Persistent);
             m_densities = new NativeArray<float>(maxsize, Allocator.Persistent);
             m_pressures = new NativeArray<float>(maxsize, Allocator.Persistent);
-            m_kernels = new NativeArray<float>(maxsize * maxsize, Allocator.Persistent);
-            m_gradients = new NativeArray<Vector3>(maxsize * maxsize, Allocator.Persistent);
             for (int i = 0; i < maxsize; i++)
             {
                 m_densities[i] = rest_density;
@@ -287,6 +308,87 @@ public class SPH : MonoBehaviour
         return v.normalized * output;
     }
 
+    // job to load particle positions and velocities into arrays
+    // IJobParticleSystemParallelFor cannot seem to run more than n loops
+    // dependency: none
+    struct ParticleDataJob : IJobParticleSystemParallelFor
+    {
+        // outputs
+        public NativeArray<Vector3> positions;
+        public NativeArray<Vector3> velocities;
+
+        public void Execute(ParticleSystemJobData particles, int i)
+        {
+            positions[i] = particles.positions[i];
+            velocities[i] = particles.velocities[i];
+        }
+    }
+
+    // job to compute kernel smoother values for each pair of particles
+    // dependency: m_positions must be updated
+    struct KernelJob : IJobParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<Vector3> positions;                  // size n
+
+        [ReadOnly]
+        public int length;
+
+        [ReadOnly]
+        public float smooth_range;
+
+        // outputs
+        public NativeArray<float> kernels;                      // size n^2
+
+        public void Execute(int i)
+        {
+            // find the two particles' indexes
+            // i = j + k * length
+            int j = i % length;
+            int k = i / length;
+
+            // TODO: create a different job to copy half of values
+            //if (j < k)
+            if (j != k)
+                kernels[i] = Kernel(positions[j], positions[k], smooth_range);
+            // else if (j > k) kernels[i] = kernels[k + j * length];
+            else kernels[i] = 0.0f;
+        }
+    }
+
+    // job to compute kernel smoother gradients for each pair of particles
+    // dependency: m_positions must be updated
+    struct KernelGradJob : IJobParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<Vector3> positions;                  // size n
+        
+        [ReadOnly]
+        public int length;
+
+        [ReadOnly]
+        public float smooth_range;
+
+        // outputs
+        public NativeArray<Vector3> gradients;                      // size n^2
+
+        public void Execute(int i)
+        {
+            // find the two particles' indexes
+            // i = j + k * length
+            int j = i % length;
+            int k = i / length;
+
+            // TODO: create a different job to copy half of values
+            //if (j < k)
+            if (j != k)
+                gradients[i] = KernelGrad(positions[j], positions[k], smooth_range);
+            // else if (j > k) gradients[i] = -gradients[k + j * length]
+            else gradients[i] = Vector3.zero;
+        }
+    }
 
     // job to update densities and pressures of each particle
     // dependency: m_kernels must be updated
