@@ -6,7 +6,6 @@
         Ihmsen et al. 2014
 */
 
-using System.Threading;
 using System.Diagnostics;
 using UnityEngine;
 using Unity.Collections;
@@ -16,14 +15,13 @@ using UnityEngine.ParticleSystemJobs;
 public class SPH : MonoBehaviour
 {
     ParticleSystem m_sys;
-    ParticleSystem.Particle[] m_particles;
     NativeArray<Vector3> m_positions;
     NativeArray<Vector3> m_velocities;
     NativeArray<Vector3> m_gradients;
     NativeArray<float> m_kernels;
     NativeArray<float> m_densities;
     NativeArray<float> m_pressures;
-    int m_size;
+    int m_size = 0;
     float m_dt;
 
     public float mass = 0.0f;
@@ -33,7 +31,6 @@ public class SPH : MonoBehaviour
     public float viscosity = 1.0f;
 
     public int thread_count = 8;
-    Thread[] m_threads;
 
     Stopwatch m_watch;
 
@@ -107,40 +104,25 @@ public class SPH : MonoBehaviour
             densities = m_densities,
             pressures = m_pressures
         };
-        var dpHandle = dpJob.Schedule(dpJob.length, dpJob.length / thread_count,
-            kernelHandle);
+        var dpHandle = dpJob.Schedule(m_size, m_size / thread_count, kernelHandle);
 
-        // complete immediately for now until more jobs are added
-        kernelGradHandle.Complete();
-        dpHandle.Complete();
-
-        // update velocities using threads
-        int thread_load = m_size / thread_count;
-        for (int i = 0; i < thread_count; i++)
+        // update velocities by accelerations
+        var accelerationJob = new AccelerationJob()
         {
-            int start = thread_load * i;
-            int end = start + thread_load;
-            m_threads[i] = new Thread(() => ThreadTaskAcceleration(start, end));
-            m_threads[i].Start();
-        }
+            positions = m_positions,
+            velocities = m_velocities,
+            gradients = m_gradients,
+            densities = m_densities,
+            pressures = m_pressures,
+            mass = mass,
+            viscosity = viscosity,
+            smooth_range = smooth_range,
+            delta_time = m_dt
+        };
 
-        // perform leftover task in main thread
-        ThreadTaskAcceleration(thread_load * thread_count, m_size);
-
-        // write results to particle system
-        for (int i = 0; i < thread_count; i++) m_threads[i].Join();
-        m_sys.SetParticles(m_particles, m_size);
-    }
-
-    // work assigned to each thread
-    void ThreadTaskAcceleration(int start, int end)
-    {
-        for (int i = start; i < end; i++)
-        {
-            m_particles[i].velocity += GetAcceleration(m_particles, m_gradients,
-                m_densities, m_pressures, i, mass, viscosity, smooth_range)
-                * m_dt;
-        }
+        var accelerationHandle = accelerationJob.Schedule(m_sys, m_size / thread_count,
+            JobHandle.CombineDependencies(kernelGradHandle, dpHandle));
+        accelerationHandle.Complete();
     }
 
     void AttributeUpdate()
@@ -164,49 +146,23 @@ public class SPH : MonoBehaviour
             mass = rest_density * Mathf.Pow(smooth_range, 3);
         }
 
-        // reallocate buffers
-        if (m_particles == null || m_particles.Length < m_sys.main.maxParticles)
+        // reallocate buffers if needed
+        if (m_size < m_sys.main.maxParticles)
         {
-            int maxsize = m_sys.main.maxParticles;
-            m_particles = new ParticleSystem.Particle[maxsize];
+            m_size = m_sys.main.maxParticles;
 
-            m_positions = new NativeArray<Vector3>(maxsize, Allocator.Persistent);
-            m_velocities = new NativeArray<Vector3>(maxsize, Allocator.Persistent);
-            m_gradients = new NativeArray<Vector3>(maxsize * maxsize, Allocator.Persistent);
-            m_kernels = new NativeArray<float>(maxsize * maxsize, Allocator.Persistent);
-            m_densities = new NativeArray<float>(maxsize, Allocator.Persistent);
-            m_pressures = new NativeArray<float>(maxsize, Allocator.Persistent);
-            for (int i = 0; i < maxsize; i++)
+            m_positions = new NativeArray<Vector3>(m_size, Allocator.Persistent);
+            m_velocities = new NativeArray<Vector3>(m_size, Allocator.Persistent);
+            m_gradients = new NativeArray<Vector3>(m_size * m_size, Allocator.Persistent);
+            m_kernels = new NativeArray<float>(m_size * m_size, Allocator.Persistent);
+            m_densities = new NativeArray<float>(m_size, Allocator.Persistent);
+            m_pressures = new NativeArray<float>(m_size, Allocator.Persistent);
+            for (int i = 0; i < m_size; i++)
             {
                 m_densities[i] = rest_density;
             }
         }
-
-        if (m_threads == null || m_threads.Length < thread_count)
-        {
-            m_threads = new Thread[thread_count];
-        }
-
-        m_size = m_sys.GetParticles(m_particles);
-        m_dt = Time.fixedDeltaTime; // copy this value for threads
-    }
-
-    // total acceleration per update
-    static Vector3 GetAcceleration(ParticleSystem.Particle[] particles,
-        NativeArray<Vector3> gradients, NativeArray<float> densities,
-        NativeArray<float> pressures, int index, float mass, float viscosity,
-        float smooth_range)
-    {
-        Vector3 ret;
-
-        // pressure
-        ret = GetPressureAcceleration(gradients, densities, pressures, index, mass);
-
-        // diffusion
-        ret += GetDiffusionAcceleration(particles, gradients, densities,
-            index, mass, viscosity, smooth_range);
-
-        return ret;
+        m_dt = Time.fixedDeltaTime; // copy this value for jobs
     }
 
     // get acceleration from pressure on one particle
@@ -231,12 +187,13 @@ public class SPH : MonoBehaviour
     }
 
     // get acceleration from diffusion/viscosity on one particle
-    static Vector3 GetDiffusionAcceleration(ParticleSystem.Particle[] particles,
-        NativeArray<Vector3> gradients, NativeArray<float> densities, int index,
-        float mass, float viscosity, float smooth_range)
+    static Vector3 GetDiffusionAcceleration(NativeArray<Vector3> positions,
+        NativeArray<Vector3> velocities, NativeArray<Vector3> gradients,
+        NativeArray<float> densities, int index, float mass, float viscosity,
+        float smooth_range)
     {
         Vector3 a = Vector3.zero;
-        int size = particles.Length;
+        int size = positions.Length;
         if (viscosity > 0.0f)
         {
             for (int j = 0; j < size; j++)
@@ -245,8 +202,8 @@ public class SPH : MonoBehaviour
                 {
                     // Ihmsen et al. Eq. (8)
                     // an approximation that avoids computing Laplacian
-                    Vector3 x_ij = particles[index].position - particles[j].position;
-                    Vector3 v_ij = particles[index].velocity - particles[j].velocity;
+                    Vector3 x_ij = positions[index] - positions[j];
+                    Vector3 v_ij = velocities[index] - velocities[j];
                     float f = Vector3.Dot(x_ij, gradients[index + j * size])
                         * (1.0f / (densities[j] *
                         (Vector3.Dot(x_ij, x_ij) + 0.01f * smooth_range * smooth_range)));
@@ -324,8 +281,8 @@ public class SPH : MonoBehaviour
         }
     }
 
-    // job to compute kernel smoother values for each pair of particles
-    // dependency: m_positions must be updated
+    // job to compute kernel smoother value for each pair of particles
+    // dependency: ParticleDataJob
     struct KernelJob : IJobParallelFor
     {
         // inputs
@@ -357,8 +314,8 @@ public class SPH : MonoBehaviour
         }
     }
 
-    // job to compute kernel smoother gradients for each pair of particles
-    // dependency: m_positions must be updated
+    // job to compute kernel smoother gradient for each pair of particles
+    // dependency: ParticleDataJob
     struct KernelGradJob : IJobParallelFor
     {
         // inputs
@@ -390,8 +347,8 @@ public class SPH : MonoBehaviour
         }
     }
 
-    // job to update densities and pressures of each particle
-    // dependency: m_kernels must be updated
+    // job to update density and pressure of each particle
+    // dependency: KernelJob
     struct DensitiesPressuresJob : IJobParallelFor
     {
         // inputs
@@ -442,6 +399,57 @@ public class SPH : MonoBehaviour
             // Ihmsen et al. Eq. (9)
             // stiffness * Mathf.Pow(m_densities[i] / rest_density, 7) - 1
             // not compatible with single precision float
+        }
+    }
+
+    // job to calculate and apply acceleration of each particle
+    // dependencies: DensitiesPressuresJob, KernelGradJob
+    struct AccelerationJob : IJobParticleSystemParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<Vector3> positions;                  // size n
+
+        [ReadOnly]
+        public NativeArray<Vector3> velocities;                 // size n
+
+        [ReadOnly]
+        public NativeArray<Vector3> gradients;                  // size n^2
+
+        [ReadOnly]
+        public NativeArray<float> densities;                    // size n
+
+        [ReadOnly]
+        public NativeArray<float> pressures;                    // size n
+
+        [ReadOnly]
+        public float mass;
+
+        [ReadOnly]
+        public float viscosity;
+
+        [ReadOnly]
+        public float smooth_range;
+
+        [ReadOnly]
+        public float delta_time;
+
+        public void Execute(ParticleSystemJobData particles, int i)
+        {
+            // calculate pressure and diffusion accelerations
+            Vector3 acceleration =
+                GetPressureAcceleration(gradients, densities, pressures, i, mass) +
+                GetDiffusionAcceleration(positions, velocities, gradients, densities,
+                i, mass, viscosity, smooth_range);
+            acceleration *= delta_time;
+
+            // add acceleration to particle velocity
+            var x = particles.velocities.x;
+            x[i] += acceleration.x;
+            var y = particles.velocities.y;
+            y[i] += acceleration.y;
+            var z = particles.velocities.z;
+            z[i] += acceleration.z;
         }
     }
 }
