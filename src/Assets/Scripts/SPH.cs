@@ -6,19 +6,22 @@
         Ihmsen et al. 2014
 */
 
-using System.Threading;
 using System.Diagnostics;
 using UnityEngine;
+using Unity.Collections;
+using Unity.Jobs;
+using UnityEngine.ParticleSystemJobs;
 
 public class SPH : MonoBehaviour
 {
     ParticleSystem m_sys;
-    ParticleSystem.Particle[] m_particles;
-    Vector3[,] m_kernelgrad_buf;
-    float[,] m_kernel_buf;
-    float[] m_densities;
-    float[] m_pressures;
-    int m_size;
+    NativeArray<Vector3> m_positions;
+    NativeArray<Vector3> m_velocities;
+    NativeArray<Vector3> m_gradients;
+    NativeArray<float> m_kernels;
+    NativeArray<float> m_densities;
+    NativeArray<float> m_pressures;
+    int m_size = 0;
     float m_dt;
 
     public float mass = 0.0f;
@@ -28,14 +31,23 @@ public class SPH : MonoBehaviour
     public float viscosity = 1.0f;
 
     public int thread_count = 8;
-    Thread[] m_threads;
 
     Stopwatch m_watch;
 
-    void Start()
+    void OnEnable()
     {
         m_watch = new Stopwatch();
         m_watch.Start();
+    }
+
+    void OnDisable()
+    {
+        m_positions.Dispose();
+        m_velocities.Dispose();
+        m_gradients.Dispose();
+        m_kernels.Dispose();
+        m_densities.Dispose();
+        m_pressures.Dispose();
     }
 
     void FixedUpdate()
@@ -48,34 +60,69 @@ public class SPH : MonoBehaviour
         // update attributes if necessary
         AttributeUpdate();
 
-        // update kernel buffers and densities
-        Precompute();
-
-        // update velocities using threads
-        int thread_load = m_size / thread_count;
-        for (int i = 0; i < thread_count; i++)
+        // update particle data
+        var dataJob = new ParticleDataJob()
         {
-            int start = thread_load * i;
-            int end = start + thread_load;
-            m_threads[i] = new Thread(() => ThreadTaskAcceleration(start, end));
-            m_threads[i].Start();
-        }
+            positions = m_positions,
+            velocities = m_velocities
+        };
+        var dataHandle = dataJob.Schedule(m_sys, m_size / thread_count);
 
-        // perform leftover task in main thread
-        ThreadTaskAcceleration(thread_load * thread_count, m_size);
-
-        // write results to particle system
-        for (int i = 0; i < thread_count; i++) m_threads[i].Join();
-        m_sys.SetParticles(m_particles, m_size);
-    }
-
-    // work assigned to each thread
-    void ThreadTaskAcceleration(int start, int end)
-    {
-        for (int i = start; i < end; i++)
+        // update kernel values and kernel gradients
+        // w(i,j) == w(j,i)
+        // grad(w(i,j)) == -grad(w(j,i))
+        // TODO: neighbour search optimization
+        var kernelJob = new KernelJob()
         {
-            m_particles[i].velocity += GetAcceleration(i) * m_dt;
-        }
+            positions = m_positions,
+            length = m_size,
+            smooth_range = smooth_range,
+            kernels = m_kernels
+        };
+        var kernelHandle = kernelJob.Schedule(m_size * m_size,
+            m_size * m_size / thread_count, dataHandle);
+
+        var kernelGradJob = new KernelGradJob()
+        {
+            positions = m_positions,
+            length = m_size,
+            smooth_range = smooth_range,
+            gradients = m_gradients
+        };
+        var kernelGradHandle = kernelGradJob.Schedule(m_size * m_size,
+            m_size * m_size / thread_count, dataHandle);
+
+        // update densities and pressures using kernel values
+        var dpJob = new DensitiesPressuresJob()
+        {
+            kernels = m_kernels,
+            length = m_size,
+            delta_time = m_dt,
+            stiffness = stiffness,
+            rest_density = rest_density,
+            mass = mass,
+            densities = m_densities,
+            pressures = m_pressures
+        };
+        var dpHandle = dpJob.Schedule(m_size, m_size / thread_count, kernelHandle);
+
+        // update velocities by accelerations
+        var accelerationJob = new AccelerationJob()
+        {
+            positions = m_positions,
+            velocities = m_velocities,
+            gradients = m_gradients,
+            densities = m_densities,
+            pressures = m_pressures,
+            mass = mass,
+            viscosity = viscosity,
+            smooth_range = smooth_range,
+            delta_time = m_dt
+        };
+
+        var accelerationHandle = accelerationJob.Schedule(m_sys, m_size / thread_count,
+            JobHandle.CombineDependencies(kernelGradHandle, dpHandle));
+        accelerationHandle.Complete();
     }
 
     void AttributeUpdate()
@@ -99,110 +146,40 @@ public class SPH : MonoBehaviour
             mass = rest_density * Mathf.Pow(smooth_range, 3);
         }
 
-        // reallocate buffers
-        if (m_particles == null || m_particles.Length < m_sys.main.maxParticles)
+        // reallocate buffers if needed
+        if (m_size < m_sys.main.maxParticles)
         {
-            int maxsize = m_sys.main.maxParticles;
-            m_particles = new ParticleSystem.Particle[maxsize];
-            m_densities = new float[maxsize];
-            m_pressures = new float[maxsize];
-            m_kernel_buf = new float[maxsize, maxsize];
-            m_kernelgrad_buf = new Vector3[maxsize, maxsize];
-            for (int i = 0; i < maxsize; i++)
+            m_size = m_sys.main.maxParticles;
+
+            m_positions = new NativeArray<Vector3>(m_size, Allocator.Persistent);
+            m_velocities = new NativeArray<Vector3>(m_size, Allocator.Persistent);
+            m_gradients = new NativeArray<Vector3>(m_size * m_size, Allocator.Persistent);
+            m_kernels = new NativeArray<float>(m_size * m_size, Allocator.Persistent);
+            m_densities = new NativeArray<float>(m_size, Allocator.Persistent);
+            m_pressures = new NativeArray<float>(m_size, Allocator.Persistent);
+            for (int i = 0; i < m_size; i++)
             {
                 m_densities[i] = rest_density;
             }
         }
-
-        if (m_threads == null || m_threads.Length < thread_count)
-        {
-            m_threads = new Thread[thread_count];
-        }
-
-        m_size = m_sys.GetParticles(m_particles);
-        m_dt = Time.fixedDeltaTime; // copy this value for threads
-    }
-
-    // total acceleration per update
-    Vector3 GetAcceleration(int index)
-    {
-        Vector3 ret;
-
-        // pressure
-        ret = GetPressureAcceleration(index);
-
-        // diffusion
-        ret += GetDiffusionAcceleration(index);
-
-        return ret;
-    }
-
-    // compute each particle's density using kernel function
-    // run this before getAcceleration()
-    void Precompute()
-    {
-        // compute kernel outputs
-        // w(i,j) == w(j,i)
-        // grad(w(i,j)) == -grad(w(j,i))
-
-        // TODO: use threads
-        // TODO: neighbour search optimization
-        for (int i = 0; i < m_size; i++)
-        {
-            for (int j = 0; j < m_size; j++)
-            {
-                if (j > i)
-                {
-                    m_kernel_buf[i, j] = Kernel(i, j);
-                    m_kernelgrad_buf[i, j] = KernelGrad(i, j);
-                }
-                else if (j < i)
-                {
-                    m_kernel_buf[i, j] = m_kernel_buf[j, i];
-                    m_kernelgrad_buf[i, j] = -m_kernelgrad_buf[j, i];
-                }
-            }
-        }
-
-        // density and pressure
-        for (int i = 0; i < m_size; i++)
-        {
-            // update densities
-            // House & Keyser Eq. (14.3)
-            m_densities[i] = 0.0f;
-            for (int j = 0; j < m_size; j++)
-            {
-                if (j != i)
-                {
-                    m_densities[i] += m_kernel_buf[i, j];
-                }
-            }
-            m_densities[i] *= mass;
-
-            // update pressures (Tait with gamma = 1)
-            // House & Keyser Eq. (14.5)
-            
-            m_pressures[i] = stiffness * (m_densities[i] - rest_density);
-            // alternative equation (Tait with gamma = 7)
-            // Ihmsen et al. Eq. (9)
-            // stiffness * Mathf.Pow(m_densities[i] / rest_density, 7) - 1
-            // not compatible with single precision float
-        }
+        m_dt = Time.fixedDeltaTime; // copy this value for jobs
     }
 
     // get acceleration from pressure on one particle
-    Vector3 GetPressureAcceleration(int index)
+    static Vector3 GetPressureAcceleration(NativeArray<Vector3> gradients,
+        NativeArray<float> densities, NativeArray<float> pressures, int index, float mass)
     {
         // find pressure force with mass 1
         // House & Keyser Eq. (14.6)
         Vector3 a = Vector3.zero;
-        float p_i = m_pressures[index] * Mathf.Pow(m_densities[index], -2);
-        for (int j = 0; j < m_size; j++)
+        float p_i = pressures[index] * Mathf.Pow(densities[index], -2);
+        int size = pressures.Length;
+        for (int j = 0; j < size; j++)
         {
             if (j != index)
             {
-                float p_j = m_pressures[j] * Mathf.Pow(m_densities[j], -2);
-                a -= (p_i + p_j) * m_kernelgrad_buf[index, j];
+                float p_j = pressures[j] * Mathf.Pow(densities[j], -2);
+                a -= (p_i + p_j) * FindKernelGrad(gradients, index, j, size);
             }
         }
         a *= mass;
@@ -210,21 +187,25 @@ public class SPH : MonoBehaviour
     }
 
     // get acceleration from diffusion/viscosity on one particle
-    Vector3 GetDiffusionAcceleration(int index)
+    static Vector3 GetDiffusionAcceleration(NativeArray<Vector3> positions,
+        NativeArray<Vector3> velocities, NativeArray<Vector3> gradients,
+        NativeArray<float> densities, int index, float mass, float viscosity,
+        float smooth_range)
     {
         Vector3 a = Vector3.zero;
+        int size = positions.Length;
         if (viscosity > 0.0f)
         {
-            for (int j = 0; j < m_size; j++)
+            for (int j = 0; j < size; j++)
             {
                 if (index != j)
                 {
                     // Ihmsen et al. Eq. (8)
                     // an approximation that avoids computing Laplacian
-                    Vector3 x_ij = m_particles[index].position - m_particles[j].position;
-                    Vector3 v_ij = m_particles[index].velocity - m_particles[j].velocity;
-                    float f = Vector3.Dot(x_ij, m_kernelgrad_buf[index, j])
-                        * (1.0f / (m_densities[j] *
+                    Vector3 x_ij = positions[index] - positions[j];
+                    Vector3 v_ij = velocities[index] - velocities[j];
+                    float f = Vector3.Dot(x_ij, FindKernelGrad(gradients, index, j, size))
+                        * (1.0f / (densities[j] *
                         (Vector3.Dot(x_ij, x_ij) + 0.01f * smooth_range * smooth_range)));
 
                     a += f * v_ij;
@@ -237,10 +218,9 @@ public class SPH : MonoBehaviour
 
     // kernel function
     // Ihmsen et al. Eq. (4) & (5)
-    float Kernel(int i, int j)
+    static float Kernel(Vector3 posi, Vector3 posj, float smooth_range)
     {
-        float length = (m_particles[i].position - m_particles[j].position)
-            .magnitude * (1.0f / smooth_range);
+        float length = (posi - posj).magnitude * (1.0f / smooth_range);
         if (length >= 2.0f) return 0.0f;
 
         float output = 3.0f / (2.0f * Mathf.PI * Mathf.Pow(smooth_range, 3));
@@ -256,10 +236,11 @@ public class SPH : MonoBehaviour
     }
 
     // kernel function gradient
-    // chain rule: grad(w(||x_i - x_j|| / h)) = w'(||x_i - x_j|| / h) * grad(||x_i - x_j|| / h)
-    Vector3 KernelGrad(int i, int j)
+    // chain rule:
+    // grad(w(||x_i - x_j|| / h)) = w'(||x_i - x_j|| / h) * grad(||x_i - x_j|| / h)
+    static Vector3 KernelGrad(Vector3 posi, Vector3 posj, float smooth_range)
     {
-        Vector3 v = m_particles[i].position - m_particles[j].position;
+        Vector3 v = posi - posj;
         float length = v.magnitude * (1.0f / smooth_range);
         if (length >= 2.0f) return Vector3.zero;
 
@@ -282,5 +263,205 @@ public class SPH : MonoBehaviour
         // = 0.5 / (h * sqrt(x^2 + y^2 + z^2)) * 2x
         // = x / (h * sqrt(x^2 + y^2 + z^2))
         return v.normalized * output;
+    }
+
+    // helper function to find value from flattened 2d array
+    static float FindKernel(NativeArray<float> kernels, int i, int j, int length)
+    {
+        if (i == j) return 0.0f;
+        return i < j? kernels[i + j * length] : kernels[j + i * length];
+    }
+
+    // helper function to find value from flattened 2d array
+    static Vector3 FindKernelGrad(NativeArray<Vector3> gradients, int i, int j, int length)
+    {
+        if (i == j) return Vector3.zero;
+        return i < j ? gradients[i + j * length] : -gradients[j + i * length];
+    }
+
+    // job to load particle positions and velocities into arrays
+    // IJobParticleSystemParallelFor cannot seem to run more than n loops
+    // dependency: none
+    struct ParticleDataJob : IJobParticleSystemParallelFor
+    {
+        // outputs
+        public NativeArray<Vector3> positions;
+        public NativeArray<Vector3> velocities;
+
+        public void Execute(ParticleSystemJobData particles, int i)
+        {
+            positions[i] = particles.positions[i];
+            velocities[i] = particles.velocities[i];
+        }
+    }
+
+    // job to compute kernel smoother value for each pair of particles
+    // dependency: ParticleDataJob
+    struct KernelJob : IJobParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<Vector3> positions;                  // size n
+
+        [ReadOnly]
+        public int length;
+
+        [ReadOnly]
+        public float smooth_range;
+
+        // outputs
+        public NativeArray<float> kernels;                      // size n^2
+
+        public void Execute(int i)
+        {
+            // find the two particles' indexes
+            // i = j + k * length
+            int j = i % length;
+            int k = i / length;
+
+            // assign values to 2D array (only a triangle matrix is assigned)
+            // TODO: use a triangle matrix structure to save wasted space
+            if (j < k)
+                kernels[i] = Kernel(positions[j], positions[k], smooth_range);
+            else kernels[i] = 0.0f;
+        }
+    }
+
+    // job to compute kernel smoother gradient for each pair of particles
+    // dependency: ParticleDataJob
+    struct KernelGradJob : IJobParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<Vector3> positions;                  // size n
+        
+        [ReadOnly]
+        public int length;
+
+        [ReadOnly]
+        public float smooth_range;
+
+        // outputs
+        public NativeArray<Vector3> gradients;                      // size n^2
+
+        public void Execute(int i)
+        {
+            // find the two particles' indexes
+            // i = j + k * length
+            int j = i % length;
+            int k = i / length;
+
+            // assign values to 2D array (only a triangle matrix is assigned)
+            // TODO: use a triangle matrix structure to save wasted space
+            if (j < k)
+                gradients[i] = KernelGrad(positions[j], positions[k], smooth_range);
+            else gradients[i] = Vector3.zero;
+        }
+    }
+
+    // job to update density and pressure of each particle
+    // dependency: KernelJob
+    struct DensitiesPressuresJob : IJobParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<float> kernels;                      // size n^2
+
+        [ReadOnly]
+        public int length;
+
+        [ReadOnly]
+        public float delta_time;
+
+        [ReadOnly]
+        public float stiffness;
+
+        [ReadOnly]
+        public float rest_density;
+
+        [ReadOnly]
+        public float mass;
+
+        // outputs
+        public NativeArray<float> densities;                    // size n
+        public NativeArray<float> pressures;                    // size n
+
+        public void Execute(int i)
+        {
+            // make sure Execute() runs n times, not n^2
+            // job.Schedule(loop count, batch size)
+
+            // update densities
+            // House & Keyser Eq. (14.3)
+            densities[i] = 0.0f;
+            for (int j = 0; j < length; j++)
+            {
+                if (j != i)
+                {
+                    densities[i] += FindKernel(kernels, i, j, length);
+                }
+            }
+            densities[i] *= mass;
+
+            // update pressures (Tait with gamma = 1)
+            // House & Keyser Eq. (14.5)
+
+            pressures[i] = stiffness * (densities[i] - rest_density);
+            // alternative equation (Tait with gamma = 7)
+            // Ihmsen et al. Eq. (9)
+            // stiffness * Mathf.Pow(m_densities[i] / rest_density, 7) - 1
+            // not compatible with single precision float
+        }
+    }
+
+    // job to calculate and apply acceleration of each particle
+    // dependencies: DensitiesPressuresJob, KernelGradJob
+    struct AccelerationJob : IJobParticleSystemParallelFor
+    {
+        // inputs
+        [ReadOnly]
+        public NativeArray<Vector3> positions;                  // size n
+
+        [ReadOnly]
+        public NativeArray<Vector3> velocities;                 // size n
+
+        [ReadOnly]
+        public NativeArray<Vector3> gradients;                  // size n^2
+
+        [ReadOnly]
+        public NativeArray<float> densities;                    // size n
+
+        [ReadOnly]
+        public NativeArray<float> pressures;                    // size n
+
+        [ReadOnly]
+        public float mass;
+
+        [ReadOnly]
+        public float viscosity;
+
+        [ReadOnly]
+        public float smooth_range;
+
+        [ReadOnly]
+        public float delta_time;
+
+        public void Execute(ParticleSystemJobData particles, int i)
+        {
+            // calculate pressure and diffusion accelerations
+            Vector3 acceleration =
+                GetPressureAcceleration(gradients, densities, pressures, i, mass) +
+                GetDiffusionAcceleration(positions, velocities, gradients, densities,
+                i, mass, viscosity, smooth_range);
+            acceleration *= delta_time;
+
+            // add acceleration to particle velocity
+            var x = particles.velocities.x;
+            x[i] += acceleration.x;
+            var y = particles.velocities.y;
+            y[i] += acceleration.y;
+            var z = particles.velocities.z;
+            z[i] += acceleration.z;
+        }
     }
 }
