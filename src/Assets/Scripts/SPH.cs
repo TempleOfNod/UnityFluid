@@ -179,7 +179,7 @@ public class SPH : MonoBehaviour
             if (j != index)
             {
                 float p_j = pressures[j] * Mathf.Pow(densities[j], -2);
-                a -= (p_i + p_j) * gradients[index + j * size];
+                a -= (p_i + p_j) * FindKernelGrad(gradients, index, j, size);
             }
         }
         a *= mass;
@@ -204,7 +204,7 @@ public class SPH : MonoBehaviour
                     // an approximation that avoids computing Laplacian
                     Vector3 x_ij = positions[index] - positions[j];
                     Vector3 v_ij = velocities[index] - velocities[j];
-                    float f = Vector3.Dot(x_ij, gradients[index + j * size])
+                    float f = Vector3.Dot(x_ij, FindKernelGrad(gradients, index, j, size))
                         * (1.0f / (densities[j] *
                         (Vector3.Dot(x_ij, x_ij) + 0.01f * smooth_range * smooth_range)));
 
@@ -265,6 +265,20 @@ public class SPH : MonoBehaviour
         return v.normalized * output;
     }
 
+    // helper function to find value from flattened 2d array
+    static float FindKernel(NativeArray<float> kernels, int i, int j, int length)
+    {
+        if (i == j) return 0.0f;
+        return i < j? kernels[i + j * length] : kernels[j + i * length];
+    }
+
+    // helper function to find value from flattened 2d array
+    static Vector3 FindKernelGrad(NativeArray<Vector3> gradients, int i, int j, int length)
+    {
+        if (i == j) return Vector3.zero;
+        return i < j ? gradients[i + j * length] : -gradients[j + i * length];
+    }
+
     // job to load particle positions and velocities into arrays
     // IJobParticleSystemParallelFor cannot seem to run more than n loops
     // dependency: none
@@ -305,11 +319,10 @@ public class SPH : MonoBehaviour
             int j = i % length;
             int k = i / length;
 
-            // TODO: create a different job to copy half of values
-            //if (j < k)
-            if (j != k)
+            // assign values to 2D array (only a triangle matrix is assigned)
+            // TODO: use a triangle matrix structure to save wasted space
+            if (j < k)
                 kernels[i] = Kernel(positions[j], positions[k], smooth_range);
-            // else if (j > k) kernels[i] = kernels[k + j * length];
             else kernels[i] = 0.0f;
         }
     }
@@ -338,11 +351,10 @@ public class SPH : MonoBehaviour
             int j = i % length;
             int k = i / length;
 
-            // TODO: create a different job to copy half of values
-            //if (j < k)
-            if (j != k)
+            // assign values to 2D array (only a triangle matrix is assigned)
+            // TODO: use a triangle matrix structure to save wasted space
+            if (j < k)
                 gradients[i] = KernelGrad(positions[j], positions[k], smooth_range);
-            // else if (j > k) gradients[i] = -gradients[k + j * length]
             else gradients[i] = Vector3.zero;
         }
     }
@@ -386,7 +398,7 @@ public class SPH : MonoBehaviour
             {
                 if (j != i)
                 {
-                    densities[i] += kernels[i + j * length];
+                    densities[i] += FindKernel(kernels, i, j, length);
                 }
             }
             densities[i] *= mass;
