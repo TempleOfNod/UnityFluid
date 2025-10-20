@@ -50,7 +50,7 @@ public class SPH : MonoBehaviour
         m_pressures.Dispose();
     }
 
-    void FixedUpdate()
+    void OnParticleUpdateJobScheduled()
     {
         // check time
         m_watch.Stop();
